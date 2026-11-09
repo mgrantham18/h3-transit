@@ -105,6 +105,22 @@ enum Commands {
         #[arg(long, default_value_t = 5050)]
         osrm_port: u16,
     },
+    /// Extracts a scoped `.h3t` containing only the given Res-8 hexes, their Res-7/6/5
+    /// parents, and edges among that closed set.
+    Subset {
+        /// Source national or regional `.h3t` index
+        #[arg(long)]
+        db: PathBuf,
+        /// Output path for the subset `.h3t`
+        #[arg(long)]
+        output: PathBuf,
+        /// Comma-separated H3 cell IDs
+        #[arg(long)]
+        hexes: Option<String>,
+        /// JSON file with a top-level `hexagons` array (`territory.json` / `agency_params.json`)
+        #[arg(long)]
+        hexes_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1780,6 +1796,70 @@ fn run_build_us(
     run_merge(output, shard_paths)
 }
 
+fn run_subset(
+    db: PathBuf,
+    output: PathBuf,
+    hexes: Option<String>,
+    hexes_file: Option<PathBuf>,
+) -> Result<()> {
+    let seeds = load_subset_seeds(hexes, hexes_file)?;
+    anyhow::ensure!(!seeds.is_empty(), "no seed hexes provided");
+    let t0 = Instant::now();
+    let index = H3CsrIndex::open_mmap(&db)
+        .with_context(|| format!("Failed to open source index {:?}", db))?;
+    let (n_orig, n_edges) = index
+        .extract_subset(&seeds, &output)
+        .with_context(|| format!("Failed to write subset {:?}", output))?;
+    println!(
+        "[subset] Wrote {} origins / {} edges from {} seeds (+ ancestors) into {:?} in {:.2}s",
+        n_orig,
+        n_edges,
+        seeds.len(),
+        output,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn load_subset_seeds(
+    hexes: Option<String>,
+    hexes_file: Option<PathBuf>,
+) -> Result<Vec<CellIndex>> {
+    let mut seeds = Vec::new();
+    if let Some(raw) = hexes {
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            seeds.push(
+                part.parse::<CellIndex>()
+                    .with_context(|| format!("Invalid H3 cell id '{}'", part))?,
+            );
+        }
+    }
+    if let Some(path) = hexes_file {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {:?}", path))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse JSON {:?}", path))?;
+        let arr = value
+            .get("hexagons")
+            .and_then(|v| v.as_array())
+            .with_context(|| format!("{:?} missing top-level 'hexagons' array", path))?;
+        for item in arr {
+            let s = item
+                .as_str()
+                .with_context(|| "hexagons entries must be strings")?;
+            seeds.push(
+                s.parse::<CellIndex>()
+                    .with_context(|| format!("Invalid H3 cell id '{}'", s))?,
+            );
+        }
+    }
+    Ok(seeds)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -1806,5 +1886,11 @@ fn main() -> Result<()> {
             max_tile_pbf_mb,
             osrm_port,
         } => run_build_us(us_pbf, work_dir, output, max_tile_pbf_mb, osrm_port),
+        Commands::Subset {
+            db,
+            output,
+            hexes,
+            hexes_file,
+        } => run_subset(db, output, hexes, hexes_file),
     }
 }

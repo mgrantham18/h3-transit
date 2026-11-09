@@ -30,7 +30,7 @@
 //!   - `dest_h3: u64` (8 bytes, little-endian)
 //!   - `summary: [u8; 10]` (`min_sec: u16, mean_sec: u16, stdev_sec: u16, p50_sec: u16, p90_sec: u16`)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -705,6 +705,70 @@ impl H3CsrIndex {
         fan
     }
 
+    /// Closes a set of seed cells under Res-7 / Res-6 / Res-5 parents so multi-resolution
+    /// lookups between any pair of seeds remain answerable from a subset index.
+    pub fn close_under_ancestors(seeds: &[CellIndex]) -> HashSet<CellIndex> {
+        let mut out = HashSet::with_capacity(seeds.len() * 4);
+        for &cell in seeds {
+            out.insert(cell);
+            if let Some(h7) = cell.parent(Resolution::Seven) {
+                out.insert(h7);
+            }
+            if let Some(h6) = cell.parent(Resolution::Six) {
+                out.insert(h6);
+            }
+            if let Some(h5) = cell.parent(Resolution::Five) {
+                out.insert(h5);
+            }
+        }
+        out
+    }
+
+    /// Extracts a scoped `.h3t` containing only the seed cells (designed for Res-8), 
+    /// their Res-7/6/5 ancestors, and every undirected edge whose both endpoints lie
+    /// in that closed set. Lookups between any two seeds then work at every distance tier.
+    pub fn extract_subset(
+        &self,
+        seed_cells: &[CellIndex],
+        output_path: impl AsRef<Path>,
+    ) -> Result<(usize, usize)> {
+        anyhow::ensure!(!seed_cells.is_empty(), "seed_cells must be non-empty");
+        let keep = Self::close_under_ancestors(seed_cells);
+        let keep_u64: HashSet<u64> = keep.iter().map(|&c| u64::from(c)).collect();
+
+        let mut records: Vec<((CellIndex, CellIndex), TransitSummary)> = Vec::new();
+        for i in 0..self.num_origins {
+            let (orig_u64, start, count) = self.origin_at(i);
+            if !keep_u64.contains(&orig_u64) {
+                continue;
+            }
+            let Ok(orig_cell) = CellIndex::try_from(orig_u64) else {
+                continue;
+            };
+            let edge_start = start as usize;
+            let edge_end = (start + count) as usize;
+            for e_idx in edge_start..edge_end {
+                let (dest_u64, summary_bytes) = self.edge_at(e_idx);
+                if !keep_u64.contains(&dest_u64) {
+                    continue;
+                }
+                let Ok(dest_cell) = CellIndex::try_from(dest_u64) else {
+                    continue;
+                };
+                records.push((
+                    (orig_cell, dest_cell),
+                    TransitSummary::from_bytes(&summary_bytes),
+                ));
+            }
+        }
+
+        anyhow::ensure!(
+            !records.is_empty(),
+            "subset produced zero edges; none of the seed cells (or their parents) appear in the source index"
+        );
+        Self::write_to_path(output_path, &records)
+    }
+
     /// Streams and merges multiple regional `.h3t` CSR index files into a single unified
     /// `.h3t` file using a two-pass K-way merge with <50 MB RAM overhead.
     pub fn merge_files(
@@ -871,5 +935,51 @@ mod tests {
                 assert!((q - q_back).abs() < 1e-4);
             }
         }
+    }
+
+    #[test]
+    fn test_extract_subset_keeps_ancestors_and_edges() {
+        use std::env::temp_dir;
+
+        // Two nearby Res-8 cells
+        let a: CellIndex = "882a100d29fffff".parse().unwrap();
+        let b: CellIndex = "882a100d2dfffff".parse().unwrap();
+        let a7 = a.parent(Resolution::Seven).unwrap();
+        let b7 = b.parent(Resolution::Seven).unwrap();
+
+        let summary = TransitSummary {
+            min_sec: 60,
+            mean_sec: 120,
+            stdev_sec: 30,
+            p50_sec: 110,
+            p90_sec: 180,
+        };
+        let records = vec![
+            ((a, a), summary),
+            ((b, b), summary),
+            ((a, b), summary),
+            ((a7, b7), summary),
+        ];
+
+        let full_path = temp_dir().join("h3t_subset_full.h3t");
+        let sub_path = temp_dir().join("h3t_subset_out.h3t");
+        H3CsrIndex::write_to_path(&full_path, &records).unwrap();
+
+        let full = H3CsrIndex::open_mmap(&full_path).unwrap();
+        let (n_orig, n_edges) = full.extract_subset(&[a, b], &sub_path).unwrap();
+        assert!(n_orig >= 2);
+        assert!(n_edges >= 3);
+
+        let sub = H3CsrIndex::open_mmap(&sub_path).unwrap();
+        assert!(sub.get_pair_res8(a, b).is_some());
+        assert!(sub.get_exact_cells(a7, b7).is_some());
+
+        let closed = H3CsrIndex::close_under_ancestors(&[a, b]);
+        assert!(closed.contains(&a));
+        assert!(closed.contains(&a7));
+        assert!(closed.contains(&a.parent(Resolution::Five).unwrap()));
+
+        let _ = std::fs::remove_file(&full_path);
+        let _ = std::fs::remove_file(&sub_path);
     }
 }
